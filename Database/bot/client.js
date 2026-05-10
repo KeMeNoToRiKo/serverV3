@@ -1,5 +1,6 @@
 const {Client, GatewayIntentBits} = require('discord.js');
 const fetchMessage = require('../fetch/fetch');
+const { listenForNewMessages } = require('../fetch/fetch');
 const channelId = process.env.CHANNEL_ID;
 
 const client = new Client({
@@ -10,19 +11,26 @@ const client = new Client({
     ],
 });
 
-// Handler used when the client is ready
+// Store whether listener has been set up
+let listenerSetup = false;
+
 const onClientReady = async () => {
     console.log(`Logged in as ${client.user?.tag}`);
     try {
         console.log("channelId: ", channelId);
+        console.log('Starting initial fetch of messages...');
         await fetchMessage(client, channelId);
-        console.log('Fetch complete. Destroying client...');
-        client.destroy();
-        client.emit('destroyed');
+        console.log('Initial fetch complete. Starting real-time message listener...');
+        
+        // Set up listener for new messages (only after fetch is completely done)
+        listenForNewMessages(client, channelId);
+        listenerSetup = true;
+        console.log('Real-time message listener is now active.');
+        
+        // Emit custom event to signal completion
+        client.emit('fetchAndListenerReady');
     } catch (err) {
         console.error('Error during fetch:', err);
-        client.destroy();
-        client.emit('destroyed');
     }
 };
 
@@ -40,3 +48,4 @@ try {
 client.once(eventName, onClientReady);
 
 module.exports = client;
+module.exports.isListenerSetup = () => listenerSetup;

@@ -4,13 +4,32 @@
 #include <string>
 #include <map>
 #include <limits>
+#include <filesystem>
+#include <cstdio>
+#include <cstdlib>
 
+
+
+/**
+ * MgaPogiV3 Configuration Utility Application
+ * This application allows users to modify the configuration settings
+ * of the MgaPogiV3 project via a command-line interface.
+ */
+
+
+// Allows clear screen to work on all OS
 #ifdef _WIN32
     #define CLEAR_SCREEN "cls"
 #else
     #define CLEAR_SCREEN "clear"
 #endif
 
+// ==============================================================
+// Allows entering to continue
+// since getch is not available in standard C++
+//
+// Makes it easier to call clear screen
+// ==============================================================
 void waitForEnter() {
     std::cout << "Press Enter to continue...";
     std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n'); // discard leftover input
@@ -19,6 +38,10 @@ void clearScreen() {
     system(CLEAR_SCREEN);
 }
 
+
+// ==============================================================
+//                            Functions
+// ==============================================================
 void resetDefault();
 void changeProviderMenu();
 void changeModelProvider();
@@ -29,18 +52,22 @@ void updateIniValue(const std::string& filename, const std::string& section,
                     const std::string& key, const std::string& newValue);
 
 
-int main() {
+int main(int argc, char* argv[]) {
+    std::filesystem::current_path(
+    std::filesystem::canonical(argv[0]).parent_path()
+    );
+    // ****** INIT VARIABLES ******
     int choice = 0;
     std::string filename = "config.ini";
     char confirm = ' ';
 
-
-    // MAIN LOOP
+    // ****** MAIN LOOP ******
     while (true)
     {
         displayMenu();
         std::cout << "Enter your choice: ";
 
+        // ** Gracefully handle all types of input **
         if (!(std::cin >> choice)) {
             // Handle non-integer input
             std::cout << "Invalid input! Please enter a number between 1 and 4." << std::endl;
@@ -54,31 +81,33 @@ int main() {
         std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n'); // flush leftover newline
         clearScreen();
 
+        // ****** VARIABLES ******
+        // We need these inside the loop to reset them each iteration
         int provider = 0;
         std::string model;
 
-        switch (choice)
-        {
-        case 1:
-            while (true) {
+        switch (choice) {
+        case 1: // **Change AI Provider**
+            while (true) { // loop until valid input
                 changeProviderMenu();
                 std::cout << "Enter your choice: ";
+                // ** Gracefully handle all types of input **
                 if (!(std::cin >> provider)) {
                     // Handle non-integer input
                     std::cout << "Invalid input! Please enter a number between 1 and 2." << std::endl;
                     std::cin.clear(); // Clear error flags
-                    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n'); // Discard invalid input
+                    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n'); // this is the c++ way of deleting input buffer
                     waitForEnter();
                     clearScreen();
                     continue;
                 }
-                if(provider == 1) {
+                if(provider == 1) { //** NONE **/
                     updateIniValue(filename, "ai", "provider", "none");
                     std::cout << "AI Provider changed to None." << std::endl;
-                } else if(provider == 2) {
+                } else if(provider == 2) { //** GEMINI **/
                     updateIniValue(filename, "ai", "provider", "gemini");
                     std::cout << "AI Provider changed to Gemini." << std::endl;
-                } else if (provider == 3) {
+                } else if (provider == 3) { //** OLLAMA **/
                     updateIniValue(filename, "ai", "provider", "ollama");
                     std::cout << "AI Provider changed to Ollama." << std::endl;
                 }
@@ -89,25 +118,33 @@ int main() {
             clearScreen();
 
             break;
-        case 2:
-            
-            while (true) {
+        case 2: // **Change Model**
+            while (true) { // loop until valid input
                 changeModelProvider();
                 std::cout << "Enter your choice: ";
+                // ** Gracefully handle all types of input **
                 if (!(std::cin >> provider)) {
                     // Handle non-integer input
                     std::cout << "Invalid input! Please enter a number between 1 and 2." << std::endl;
                     std::cin.clear(); // Clear error flags
-                    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n'); // Discard invalid input
+                    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n'); // Why do we even need this again???
                     waitForEnter();
                     clearScreen();
                     continue;
                 }
-                std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+                std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n'); // again
                 clearScreen();
                 changeModelMenu();
+                // We use getline instead of cin to allow spaces in model names
                 std::getline(std::cin, model);
 
+                // ** What in the ternary abomination is this **
+                /**
+                 * Reads like:
+                 * If provider is 1 (Gemini), update the Gemini model,
+                 * else update the Ollama model.
+                 * Dapat if else nalang noh
+                 */
                 provider == 1 ? updateIniValue(filename, "model", "gemini", model) :
                                 updateIniValue(filename, "model", "ollama", model);
                 std::cout << "Model updated successfully." << std::endl;
@@ -116,12 +153,14 @@ int main() {
                 break;
             }
             break;
-        case 3:
+        case 3: // **Change Prompt**
             while (true) {
                     changePromptMenu();
                     std::string prompt;
-                    std::getline(std::cin, prompt);
+                    std::getline(std::cin, prompt); // allow spaces in prompt
 
+                    // ** Confirm prompt change **
+                    // we don't want accidental changes
                     while (true) {
                         std::cout << "Are you sure you want to change the prompt to:\n\"" << prompt << "\" ? (y/n): ";
                         std::cin >> confirm;
@@ -148,13 +187,20 @@ int main() {
                 }
                 break;
 
-
-        case 4:
-
-        
-            
-
-            while (true) {
+        // **Reset to Default**
+        /**
+         *  Default Values are:
+         * AI Provider: none
+         * Gemini Model: gemini-2.0-flash
+         * Ollama Model: gemma3
+         * Prompt: You will answer the question only in the given choices of answers.
+         * If you think there is no correct answer, you will guess the best answer from the given choices.
+         * If asked to choose more than one answer, separate them by a newline\nQuestion:
+         * 
+         * The user may confirm or cancel the reset action.
+         */
+        case 4: 
+            while (true) { // we don't want accidental resets
                 std::cout << "Are you sure you want to reset to default values? (y/n): ";
                 std::cin >> confirm;
 
@@ -163,6 +209,12 @@ int main() {
 
                         if(confirm == 'y' || confirm == 'Y') {
                             // WHATDAFAK IS DIS????? (works)
+                            /**
+                             * Reads like:
+                             * If confirm is 'y' or 'Y', call resetDefault() and print success message,
+                             * else print reset canceled message.
+                             * It uses lambda functions to achieve this in a single expression. (WOW!)
+                             */
                             (confirm == 'y' || confirm == 'Y') 
                             ? [](){ resetDefault(); std::cout << "Configuration reset to default values." << std::endl;}() 
                             : [](){ std::cout << "Reset canceled." << std::endl; }();
@@ -179,7 +231,7 @@ int main() {
             waitForEnter();
             clearScreen();
             break;
-        case 5:
+        case 5: // **Exit**
             std::cout << "Exiting..." << std::endl;
             waitForEnter();
             return 0;
@@ -193,6 +245,10 @@ int main() {
     
 }
 
+// **=============================================================================
+//                          Function Definitions
+// **=============================================================================
+
 void displayMenu() {
     std::cout << "=== MgaPogiV3 Configuration Menu ===" << std::endl;
     std::cout << "1. Change AI Provider" << std::endl;
@@ -202,51 +258,91 @@ void displayMenu() {
     std::cout << "5. Exit" << std::endl;
 }
 
-// Function to update a key in a section
-void updateIniValue(const std::string& filename, const std::string& section,
-                    const std::string& key, const std::string& newValue) {
-    std::ifstream infile(filename);
-    std::ofstream outfile("config_temp.ini");
+void updateIniValue(const std::string& filename,
+                    const std::string& section,
+                    const std::string& key,
+                    const std::string& newValue)
+{
+    std::filesystem::path configPath = std::filesystem::absolute(filename);
+    std::filesystem::path tempPath   = configPath.string() + ".tmp";
 
-    if (!infile.is_open() || !outfile.is_open()) {
-        std::cerr << "Error opening config file." << std::endl;
+    // Ensure config file exists
+    if (!std::filesystem::exists(configPath)) {
+        std::ofstream create(configPath);
+        create.close();
+    }
+
+    std::ifstream infile(configPath);
+    if (!infile.is_open()) {
+        std::cerr << "Failed to open config file: "
+                  << configPath << std::endl;
+        return;
+    }
+
+    std::ofstream outfile(tempPath);
+    if (!outfile.is_open()) {
+        std::cerr << "Failed to create temp config file." << std::endl;
         return;
     }
 
     std::string line;
     std::string currentSection;
+    bool sectionFound = false;
+    bool keyWritten   = false;
 
     while (std::getline(infile, line)) {
         std::string trimmed = line;
-        // Remove spaces from start
         trimmed.erase(0, trimmed.find_first_not_of(" \t"));
 
-        // Detect section
-        if (!trimmed.empty() && trimmed[0] == '[') {
+        // Section header
+        if (!trimmed.empty() &&
+            trimmed.front() == '[' &&
+            trimmed.back()  == ']')
+        {
+            if (sectionFound && !keyWritten) {
+                outfile << key << "=" << newValue << '\n';
+                keyWritten = true;
+            }
+
             currentSection = trimmed;
-            outfile << line << std::endl;
+            outfile << line << '\n';
+
+            if (currentSection == "[" + section + "]") {
+                sectionFound = true;
+            }
             continue;
         }
 
-        // Only modify lines in the correct section
-        if (currentSection == "[" + section + "]") {
-            // Skip commented keys
-            if (trimmed.find(key + "=") == 0) {
-                outfile << key << "=" << newValue << std::endl;
-                continue;
-            }
+        // Key replacement
+        if (currentSection == "[" + section + "]" &&
+            trimmed.rfind(key + "=", 0) == 0)
+        {
+            outfile << key << "=" << newValue << '\n';
+            keyWritten = true;
         }
+        else {
+            outfile << line << '\n';
+        }
+    }
 
-        outfile << line << std::endl;
+    // Missing section → append
+    if (!sectionFound) {
+        outfile << "\n[" << section << "]\n";
+        outfile << key << "=" << newValue << '\n';
+    }
+    // Section exists but key missing
+    else if (!keyWritten) {
+        outfile << key << "=" << newValue << '\n';
     }
 
     infile.close();
     outfile.close();
 
-    // Replace original file
-    std::remove(filename.c_str());
-    std::rename("config_temp.ini", filename.c_str());
+    // Atomic replace (Windows / Linux / macOS)
+    std::filesystem::remove(configPath);
+    std::filesystem::rename(tempPath, configPath);
 }
+
 
 void changeProviderMenu() {
     std::cout << "Select AI Provider to change:" << std::endl;

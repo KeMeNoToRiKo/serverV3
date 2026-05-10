@@ -12,17 +12,27 @@
   "type": "commonjs",
   "dependencies": {
     "@google/genai": "^1.27.0",
-    "axios": "^1.13.1",
+    "axios": "^1.13.2",
+    "chalk": "^4.1.2",
     "cors": "^2.8.5",
-    "discord.js": "^14.24.1",
+    "discord.js": "^14.25.1",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
-    "express-rate-limit": "^8.1.0",
+    "express-rate-limit": "^8.2.1",
     "fs": "^0.0.1-security",
     "ini": "^5.0.0",
-    "mongodb": "^6.20.0",
-    "mongoose": "^8.19.2",
+    "mongodb": "^6.21.0",
+    "mongoose": "^8.20.1",
+    "openai": "^6.9.1",
     "path": "^0.12.7"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KeMeNoToRiKo/serverV3.git"
+  },
+  "bugs": {
+    "url": "https://github.com/KeMeNoToRiKo/serverV3/issues"
+  },
+  "homepage": "https://github.com/KeMeNoToRiKo/serverV3#readme",
   "devDependencies": {}
 }

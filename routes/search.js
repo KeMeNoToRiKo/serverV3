@@ -7,6 +7,7 @@ const { callOllama } = require('../ai/ollama');
 const fs = require('fs');
 const ini = require('ini');
 const { fuzzySearch } = require('./searchUtils');
+const chalk = require('chalk');
 
 
 
@@ -51,11 +52,10 @@ router.get('/', async (req, res) => {
         // 1. Search by questionId
         // --------------------------------------
         if (questionId) {
-            // note: model stores answers under Answer.Question_ID
-            const idQuery = { 'Answer.Question_ID': questionId };
-            console.log("Searching by questionId:", idQuery);
+            // note: model stores answers under Answer.Question_ID (Answer is an array)
+            const idQuery = { 'Answer': { $elemMatch: { Question_ID: questionId } } };
+            console.log("Searching by questionId:", questionId);
             result = await collection.findOne(idQuery);
-            console.log("Result for questionId:", result);
             if (result) searchMethod = 'questionId';
         }
 
@@ -65,7 +65,7 @@ router.get('/', async (req, res) => {
         // --------------------------------------
         if (!result && questionText) {
         const textQuery = { Question: questionText };
-        console.log('Searching by questionText:', textQuery);
+        console.log('Searching by questionText:', questionText);
         result = await collection.findOne(textQuery);
         if (result) searchMethod = 'questionText';
         }
@@ -75,7 +75,7 @@ router.get('/', async (req, res) => {
         // 3. ATLAS SEARCH (fuzzy, high accuracy)
         // --------------------------------------
         if (questionText) {
-            console.log("Running Atlas Search fuzzy match...");
+            console.log("Running Atlas Search fuzzy match for:", questionText);
 
             const atlasResults = await collection.aggregate([
                 {
@@ -95,6 +95,7 @@ router.get('/', async (req, res) => {
             ]).toArray();
 
             if (atlasResults.length > 0) {
+                console.log("Found via Atlas Search:");
                 return res.json({
                     result: atlasResults[0],
                     searchMethod: 'questionText',
@@ -123,9 +124,24 @@ router.get('/', async (req, res) => {
 
         // If we have a DB result, return it
         if (result) {
-            result.searchMethod = 'questionText';
+            result.searchMethod = searchMethod || 'questionText';
             result.originalQuestion = questionText;
-            console.log("Final search result:", result);
+            
+
+            // Nicely formatted, cross-platform console output using `chalk`
+            console.log();
+            console.log(chalk.bold.yellowBright('================ DB Search Result ================'));
+            if (Array.isArray(result.Answer) && result.Answer.length > 0) {
+                result.Answer.forEach((ans, idx) => {
+                    console.log(chalk.bold(`Question Text:`) + ' ' + chalk.green(result.Question));
+                    console.log(chalk.bold('Question ID:') + ' ' + chalk.green(ans.Question_ID));
+                    console.log(chalk.bold(`Answer ${idx + 1}:`) + ' ' + chalk.green(ans.Answer_Text));
+                    console.log(chalk.bold.yellowBright('--------------------------------------------------'));
+                });
+            } else {
+                console.log(chalk.red('(No answers array present)'));
+            }
+
             return res.json({ result });
         }
 

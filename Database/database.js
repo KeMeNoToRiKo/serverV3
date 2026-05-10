@@ -2,26 +2,8 @@ function discordToDatabase() {
     const client = require('./bot/client');
     const { getTodaysBibleVerse } = require('../utils/bible');
 
-    // Return a promise that resolves when the client is destroyed so callers may await if they want.
+    // Return a promise that resolves after initial fetch and listener setup are complete
     return new Promise(async (resolve) => {
-        client.once('destroyed', () => {
-            console.log('Client destroyed. Discord-to-database task finished.');
-            //console.clear(); // Clear the console screen
-            console.log("MgaPogi Server V3");
-            console.log();
-            console.log("Today's Bible Verse:");
-            getTodaysBibleVerse().then(verseData => {
-                if (verseData) {
-                    console.log(`${verseData.text} — ${verseData.reference}`);
-                }
-                console.log("Thanks be to God!");
-                console.log();
-                console.log("Server is running...");
-                // Do not exit the process here; resolve the promise so the caller can handle continuation.
-                resolve();
-            });
-        });
-
         const token = process.env.DISCORD_TOKEN || process.env.BOT_TOKEN;
         if (!token) {
             console.error('Discord token not set. Please set DISCORD_TOKEN in .env');
@@ -30,6 +12,29 @@ function discordToDatabase() {
         }
 
         try {
+            // Listen for the custom event that signals fetch AND listener are ready
+            client.once('fetchAndListenerReady', async () => {
+                // Clear console and display startup message AFTER fetch is completely done
+                console.clear();
+                console.log("MgaPogi Server V3");
+                console.log("Version: 3.0.1");
+                console.log();
+                console.log("Today's Bible Verse:");
+                
+                // Wait for the Bible verse to load
+                const verseData = await getTodaysBibleVerse();
+                if (verseData) {
+                    console.log(`${verseData.text} — ${verseData.reference}`);
+                }
+                console.log("Thanks be to God!");
+                console.log();
+                console.log("Server is running...");
+                console.log("Discord client is connected and monitoring for new messages.");
+                
+                // Now resolve the promise
+                resolve();
+            });
+
             await client.login(token);
             console.log("Starting Discord to Database process...");
         } catch (err) {
