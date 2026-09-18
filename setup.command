@@ -12,5 +12,6 @@ read -p "npm init complete. Press Enter to continue..."
 clear
 
 npm install
+npm audit fix
 echo
 read -p "npm install complete. Press Enter to close..."

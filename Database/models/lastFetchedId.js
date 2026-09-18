@@ -1,10 +1,11 @@
 const mongoose = require('mongoose');
 
-const lastFetchedIdSchema = new mongoose.Schema({
-  key: { type: String, required: true, unique: true },
-  value: { type: String, required: true }
-});
+const lastFetchedIdSchema = new mongoose.Schema(
+    {
+        key: { type: String, required: true, unique: true, index: true },
+        value: { type: String, required: true },
+    },
+    { timestamps: true }
+);
 
-const LastFetchedId = mongoose.model('LastFetchedId', lastFetchedIdSchema);
-
-module.exports = LastFetchedId;
+module.exports = mongoose.model('LastFetchedId', lastFetchedIdSchema);

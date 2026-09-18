@@ -97,25 +97,57 @@ async function fuzzySearch(collection, questionText, userOptions = {}) {
     try {
         const exactEscaped = escapeRegex(questionText || '');
         if (exactEscaped) {
-            const result = await collection.findOne({
+            const docs = await collection.find({
                 Question: { $regex: `^${exactEscaped}$`, $options: 'i' }
-            });
+            }).limit(5).toArray();
+            const result = pickBest(docs);
             if (result) return { method: 'exact', result };
         }
     } catch (err) {
         if (debug) console.warn("Exact-match query failed:", err.message);
     }
 
+    // Strategy 1.5: the query text appears verbatim as a substring of a stored question.
+    // Handles questions stored with extra context (preamble, image links, footnotes)
+    // where the user only sends the core sentence — e.g. "then what is P(50)." while
+    // the stored question starts with "If P(n) is the statement: [image] then what is P(50)."
+    if (questionText && questionText.length >= 8) {
+        try {
+            const substringEscaped = escapeRegex(questionText);
+            const docs = await collection
+                .find({ Question: { $regex: substringEscaped, $options: 'is' } })
+                .limit(5)
+                .toArray();
+            const r = pickBest(docs);
+            if (r) return { method: 'substring', result: r };
+        } catch (err) {
+            if (debug) console.warn('Substring match failed:', err.message);
+        }
+    }
+
     if (!normalizedQuery) return null;
+
+    // Extract compound alpha-numeric tokens BEFORE normalize() splits them.
+    // e.g. "P(50)" → "p50", "f(x)" → "fx", "sin(45)" → "sin45".
+    // normalize() turns "P(50)" into "p 50", discarding the meaningful compound form
+    // and leaving only short fragments that get filtered out by minSignificantTokenLength.
+    const compoundTokens = (questionText.match(/[a-zA-Z_]\w*\(\w+\)/g) || [])
+        .map(m => m.replace(/[^a-z0-9]/gi, '').toLowerCase())
+        .filter(t => t.length >= 2);
 
     // Get tokens and expand variants
     const tokens = normalizedQuery.split(' ').filter(Boolean);
-    let expandedTokens = [];
+    let expandedTokens = [...compoundTokens];
     tokens.forEach(t => expandedTokens.push(...tokenVariants(t)));
     // dedupe while preserving approximate order
     expandedTokens = Array.from(new Set(expandedTokens));
-    // keep tokens that meet minimal length (but allow small tokens if requested)
-    const significantTokens = expandedTokens.filter(t => t.length >= minSignificantTokenLength);
+
+    // Keep tokens meeting min length OR short (≥2-char) purely numeric tokens.
+    // Numbers like "50" or "12" are highly discriminating in math/science questions
+    // but are dropped by the default minSignificantTokenLength of 3.
+    const significantTokens = expandedTokens.filter(
+        t => t.length >= minSignificantTokenLength || (t.length >= 2 && /^\d+$/.test(t))
+    );
 
     if (significantTokens.length === 0 && tokens.length > 0) {
         // fallback: try tokens of length >= 3
@@ -130,19 +162,21 @@ async function fuzzySearch(collection, questionText, userOptions = {}) {
         const variants = tokenVariants(single);
         for (const v of variants) {
             const escaped = escapeRegex(v);
-            // Use word boundary \b for typical word boundaries (works for letters/digits/underscore)
             const regex = `\\b${escaped}\\b`;
-            const r = await collection.findOne({ Question: { $regex: regex, $options: 'i' } });
+            const docs = await collection.find({ Question: { $regex: regex, $options: 'i' } }).limit(5).toArray();
+            const r = pickBest(docs);
             if (r) return { method: 'token', result: r };
         }
     }
 
-    // Strategy 3: ordered fuzzy regex with a noise window (build from primary token words)
+    // Strategy 3: ordered fuzzy regex with a noise window (build from primary token words).
+    // 'is' flags: case-insensitive + dotAll so '.' crosses newlines in multi-line questions.
     if (significantTokens.length > 1) {
         const pieces = significantTokens.map(t => escapeRegex(t));
-        const fuzzy = pieces.join(`.{0,${noiseWindow}}`);
+        const fuzzy = pieces.join(`[\\s\\S]{0,${noiseWindow}}`);
         try {
-            const r = await collection.findOne({ Question: { $regex: fuzzy, $options: 'i' } });
+            const docs = await collection.find({ Question: { $regex: fuzzy, $options: 'i' } }).limit(5).toArray();
+            const r = pickBest(docs);
             if (r) return { method: 'fuzzy_regex', result: r };
         } catch (err) {
             if (debug) console.warn("fuzzy_regex failed:", err.message);
@@ -224,7 +258,8 @@ async function fuzzySearch(collection, questionText, userOptions = {}) {
 
         // Combined score: tokensFound ratio dominates, with a small position weight and a tiny similarity tie-break
         const tokenRatio = tokensFound / Math.max(1, significantTokens.length);
-        const score = tokenRatio * (1 - positionWeight) + positionScore * positionWeight + similarity * 0.02;
+        const hasCorrect = Array.isArray(doc.Answer) && doc.Answer.some(a => a.Correct === true) ? 0.01 : 0;
+        const score = tokenRatio * (1 - positionWeight) + positionScore * positionWeight + similarity * 0.02 + hasCorrect;
 
         return { doc, score, similarity, tokensFound };
     }).sort((a, b) => b.score - a.score);
@@ -239,4 +274,10 @@ async function fuzzySearch(collection, questionText, userOptions = {}) {
     return null;
 }
 
-module.exports = { fuzzySearch, normalize, tokenVariants, similarityRatio };
+function pickBest(docs) {
+    if (!docs || docs.length === 0) return null;
+    const withCorrect = docs.find(d => Array.isArray(d.Answer) && d.Answer.some(a => a.Correct === true));
+    return withCorrect || docs[0];
+}
+
+module.exports = { fuzzySearch, normalize, tokenVariants, similarityRatio, pickBest };

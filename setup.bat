@@ -6,5 +6,6 @@ set /p CONTINUE_INIT="npm init complete. Press Enter to continue..."
 
 CLS
 call npm install
+call npm audit fix
 echo.
 set /p CONTINUE_INSTALL="npm install complete. Press Enter to close..."

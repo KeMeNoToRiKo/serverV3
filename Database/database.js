@@ -17,13 +17,14 @@ function discordToDatabase() {
                 // Clear console and display startup message AFTER fetch is completely done
                 console.clear();
                 console.log("MgaPogi Server V3");
-                console.log("Version: 3.0.1");
+                console.log("Version: 3.1");
                 console.log();
-                console.log("Today's Bible Verse:");
+                
                 
                 // Wait for the Bible verse to load
                 const verseData = await getTodaysBibleVerse();
                 if (verseData) {
+                    console.log("Today's Bible Verse:");
                     console.log(`${verseData.text} — ${verseData.reference}`);
                 }
                 console.log("Thanks be to God!");

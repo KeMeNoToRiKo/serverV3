@@ -1,4 +1,5 @@
-import OpenAI from "openai";
+const OpenAI = require('openai');
+
 const client = new OpenAI();
 
 async function callOpenAI(question, answerChoice, model, prompt) {
@@ -6,21 +7,19 @@ async function callOpenAI(question, answerChoice, model, prompt) {
     if (answerChoice) {
         MASTER_PROMPT += `\nAnswer Choices: ${answerChoice}`;
     }
-    console.log("Calling OpenAI with prompt:", MASTER_PROMPT);
+    console.log('Calling OpenAI with prompt:', MASTER_PROMPT);
 
     try {
-        const response = await client.responses.create({
+        const response = await client.chat.completions.create({
             model: model,
-            input: MASTER_PROMPT
+            messages: [{ role: 'user', content: MASTER_PROMPT }],
         });
 
-        return response.output_text;
-
+        return response.choices[0]?.message?.content ?? null;
     } catch (error) {
-        console.error("Error calling OpenAI:", error);
+        console.error('Error calling OpenAI:', error);
         throw error;
     }
 }
-
 
 module.exports = { callOpenAI };

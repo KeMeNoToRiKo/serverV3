@@ -1,20 +1,89 @@
 /**
- *  TO DO:
- *  - fix fetching logic to stop at last fetched id ✅ DONE
- *  - FIX SCHEMA WHEN RELEASING
+ * fetch.js — fetches Discord messages and stores parsed Q&A into MongoDB.
+ *
+ * Concurrency-safety notes:
+ *  - The initial backfill (`fetchMessage`) and the realtime listener
+ *    (`listenForNewMessages`) can both call `processAndStoreMessage` for the
+ *    SAME message id during a small window after startup. We deduplicate via
+ *    an in-memory `inFlight` Set keyed on message.id.
+ *  - Two different messages can carry the same Question_ID (e.g. the bot edits
+ *    the embed and re-posts). Without a unique index, two concurrent processors
+ *    would both pass the `findOne` "exists?" check and both insert, creating
+ *    duplicates. We rely on the unique index on `Question_ID` (see schema.js)
+ *    AND we use atomic upserts so the second writer cleanly converts to an
+ *    update instead of crashing.
+ *  - lastFetchedId is updated with a conditional update that only moves it
+ *    FORWARD, so an out-of-order write from the listener can never overwrite
+ *    a higher value already saved by the backfill (or vice-versa).
  */
-
-const fs = require('fs');
-const path = require('path');
 
 const ParsedMessage = require('../models/schema');
 const LastFetchedId = require('../models/lastFetchedId');
 const parseMessageEmbed = require('../utils/embedParser');
 
-// --- Separate function to process and store a single message ---
-const processAndStoreMessage = async (message) => {
+const LAST_FETCHED_KEY = 'lastfetchedidV3';
+
+// Per-message dedup: prevents the initial fetch loop and the realtime listener
+// from both processing the same message ID simultaneously.
+const inFlight = new Set();
+
+/**
+ * Atomically advance the stored lastFetchedId, but only if `candidateId` is
+ * greater than what's currently stored. Uses BigInt comparison via a read,
+ * then a conditional write — racy in theory but the comparison happens in DB
+ * via $expr so two concurrent callers can't both regress the value.
+ *
+ * MongoDB doesn't support $expr in updateOne filter for the comparison we need
+ * across BigInt strings cleanly, so we serialize the read+write per call.
+ * Worst case under contention: a slightly-out-of-order write is rejected and
+ * we re-read on next call. lastFetchedId only matters as a "where to resume"
+ * hint, not as a strict watermark — so this is safe.
+ */
+async function advanceLastFetchedId(candidateIdStr) {
+    if (!candidateIdStr) return;
     try {
-        // --- Parse message embeds ---
+        const candidate = BigInt(candidateIdStr);
+        const existing = await LastFetchedId.findOne({ key: LAST_FETCHED_KEY }).lean();
+        const current = existing && existing.value ? BigInt(existing.value) : BigInt(0);
+
+        if (candidate <= current) return; // never go backwards
+
+        // Conditional update: only set if the value we read is still there.
+        // If another worker raced ahead of us, this updates 0 docs and we drop it.
+        const res = await LastFetchedId.updateOne(
+            { key: LAST_FETCHED_KEY, value: existing ? existing.value : { $exists: false } },
+            { $set: { value: candidateIdStr } },
+            { upsert: !existing }
+        );
+
+        if (res.matchedCount === 0 && !existing) {
+            // Race: someone else upserted the doc between our read and write.
+            // That's fine — they have a value; we'll catch up on the next call.
+        }
+    } catch (err) {
+        // Duplicate-key on first-ever upsert is also benign (another worker won)
+        if (err && err.code === 11000) return;
+        console.error('Error advancing lastFetchedId:', err);
+    }
+}
+
+/**
+ * Process and atomically store a single message.
+ * Safe to call concurrently for the same Question_ID — the unique index
+ * guarantees only one document exists; concurrent calls converge via upserts.
+ */
+const processAndStoreMessage = async (message) => {
+    const messageKey = message?.id;
+    // Skip if we're already processing this message (initial fetch ↔ listener race)
+    if (messageKey && inFlight.has(messageKey)) {
+        return false;
+    }
+    if (messageKey) inFlight.add(messageKey);
+
+    try {
+        // Skip messages from non-bot sources if you want — left configurable
+        // by NOT filtering here; caller can filter before invoking us.
+
         const parsedData = await parseMessageEmbed(message);
         if (!parsedData || !Array.isArray(parsedData.Answer)) return false;
 
@@ -24,38 +93,70 @@ const processAndStoreMessage = async (message) => {
             return false;
         }
 
-        // --- Check existing entries ---
-        const existing = await ParsedMessage.findOne({ 'Answer.Question_ID': questionId });
-        const existingHasCorrect = !!(
-            existing &&
-            existing.Answer &&
-            existing.Answer.some(a => a.Question_ID === questionId && a.Correct === true)
-        );
-        if (existingHasCorrect) {
-            console.log(`Question ${questionId} already has a correct answer. Skipping.`);
-            return false;
-        }
-
-        // --- Process answers ---
         const questionType = String(parsedData.Question_Type || '').toLowerCase();
         const isFillMultiple =
             questionType.includes('fill_in_multiple_blanks') ||
             questionType.includes('fill in multiple blanks');
 
-        const answersToAppend = [];
+        // Strip _rawEmoji helper before persisting
+        const cleanAnswers = parsedData.Answer.map(({ _rawEmoji, ...a }) => a);
 
-        for (const a of parsedData.Answer) {
+        // ----------------------------------------------------------------
+        // STEP 1: Atomically ensure a document exists for this Question_ID.
+        // findOneAndUpdate with upsert + $setOnInsert is the standard pattern
+        // for "create if missing, otherwise leave alone" without a race.
+        // ----------------------------------------------------------------
+        let doc;
+        try {
+            doc = await ParsedMessage.findOneAndUpdate(
+                { Question_ID: questionId },
+                {
+                    $setOnInsert: {
+                        Question_ID: questionId,
+                        Title: parsedData.Title,
+                        Question: parsedData.Question,
+                        Answer: [],
+                        HasPartial: !!parsedData.partial,
+                    },
+                },
+                { new: true, upsert: true, setDefaultsOnInsert: true }
+            );
+        } catch (err) {
+            // E11000 here means a parallel writer just upserted between our check
+            // and write. Read the now-existing doc and continue.
+            if (err && err.code === 11000) {
+                doc = await ParsedMessage.findOne({ Question_ID: questionId });
+                if (!doc) {
+                    console.error(`E11000 race but doc not found for ${questionId}; aborting.`);
+                    return false;
+                }
+            } else {
+                throw err;
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // STEP 2: Per-answer reconciliation.
+        // For each parsed answer, decide:
+        //   - skip (already stored as correct)
+        //   - upgrade (existing was wrong, new says correct)
+        //   - append (brand new Answer_ID we haven't seen)
+        // All updates are atomic via positional operators / arrayFilters.
+        // ----------------------------------------------------------------
+        const existingAnswers = Array.isArray(doc.Answer) ? doc.Answer : [];
+
+        for (const a of cleanAnswers) {
             const ansId = a.Answer_ID;
-            const existingAns =
-                existing && existing.Answer
-                    ? existing.Answer.find(x => x.Answer_ID === ansId)
-                    : null;
+            if (!ansId) continue;
+
+            const existingAns = existingAnswers.find((x) => x.Answer_ID === ansId);
 
             if (existingAns) {
-                if (existingAns.Correct === false && a.Correct === true) {
+                // Upgrade an incorrect answer to correct if new info says so.
+                if (existingAns.Correct !== true && a.Correct === true) {
                     try {
-                        await ParsedMessage.updateOne(
-                            { _id: existing._id, 'Answer.Answer_ID': ansId },
+                        const r = await ParsedMessage.updateOne(
+                            { _id: doc._id, 'Answer.Answer_ID': ansId },
                             {
                                 $set: {
                                     'Answer.$.Correct': true,
@@ -63,67 +164,62 @@ const processAndStoreMessage = async (message) => {
                                 },
                             }
                         );
-                        console.log(
-                            `Updated Answer_ID ${ansId} for question ${questionId}: marked correct.`
-                        );
+                        if (r.modifiedCount > 0) {
+                            console.log(
+                                `Upgraded Answer_ID ${ansId} for question ${questionId} → correct.`
+                            );
+                        }
                     } catch (err) {
                         console.error(`Failed to update answer ${ansId}:`, err);
                     }
                 }
+                // else: existing is already correct or new info doesn't add value — skip.
             } else {
-                if (isFillMultiple && a.Correct === false) {
-                    console.log(
-                        `Skipping incorrect answer ${ansId} (fill-in-multiple-blanks).`
-                    );
+                // For fill-in-multiple-blanks, only append known-correct answers.
+                if (isFillMultiple && a.Correct !== true) {
                     continue;
                 }
-                answersToAppend.push(a);
+                // Append-if-absent atomically. $addToSet by Answer_ID isn't directly
+                // expressible on a sub-document array, so we use a filter that
+                // requires the Answer_ID to NOT be present.
+                try {
+                    const r = await ParsedMessage.updateOne(
+                        {
+                            _id: doc._id,
+                            'Answer.Answer_ID': { $ne: ansId },
+                        },
+                        {
+                            $push: { Answer: a },
+                            $set: {
+                                HasPartial: !!(doc.HasPartial || parsedData.partial),
+                            },
+                        }
+                    );
+                    if (r.modifiedCount > 0) {
+                        console.log(`Appended Answer_ID ${ansId} to question ${questionId}.`);
+                    }
+                    // modifiedCount === 0 here means another writer just inserted
+                    // this Answer_ID before us — totally fine, idempotent.
+                } catch (err) {
+                    console.error(`Failed to append answer ${ansId}:`, err);
+                }
             }
         }
 
-        // --- Save to database ---
-        if (!existing) {
-            if (answersToAppend.length > 0) {
-                const doc = new ParsedMessage({
-                    Title: parsedData.Title,
-                    Question: parsedData.Question,
-                    Answer: answersToAppend,
-                    HasPartial: !!parsedData.partial,
-                });
-                await doc.save();
-                console.log(
-                    `Inserted new question ${questionId} with ${answersToAppend.length} answers.`
-                );
-            } else {
-                console.log('No new answers to insert for new question.');
-            }
-        } else {
-            if (answersToAppend.length > 0) {
-                await ParsedMessage.updateOne(
-                    { _id: existing._id },
-                    {
-                        $push: { Answer: { $each: answersToAppend } },
-                        $set: { HasPartial: existing.HasPartial || !!parsedData.partial },
-                    }
-                );
-                console.log(
-                    `Appended ${answersToAppend.length} answers to question ${questionId}.`
-                );
-            }
-        }
         return true;
     } catch (err) {
         console.error('Error processing message:', err);
         return false;
+    } finally {
+        if (messageKey) inFlight.delete(messageKey);
     }
 };
 
 const fetchMessage = async (client, channelId) => {
     let lastFetchedId = null;
 
-    // --- Get last fetched message ID from DB ---
     try {
-        const lastIdDoc = await LastFetchedId.findOne({ key: 'lastfetchedidV3' });
+        const lastIdDoc = await LastFetchedId.findOne({ key: LAST_FETCHED_KEY }).lean();
         if (lastIdDoc) {
             lastFetchedId = lastIdDoc.value;
             console.log(`Will stop fetching once reaching last fetched ID: ${lastFetchedId}`);
@@ -148,15 +244,12 @@ const fetchMessage = async (client, channelId) => {
         console.log('Starting message fetch...');
         let allMessagesFetched = false;
         let reachedLastFetched = false;
-
-        let fetchBefore = undefined; // Start from the newest messages
-        let newestIdSeen = lastFetchedId ? BigInt(lastFetchedId) : BigInt(0);
-        console.log(`Initial newestIdSeen: ${newestIdSeen.toString()}`);
+        let fetchBefore;
+        const lastFetchedBig = lastFetchedId ? BigInt(lastFetchedId) : BigInt(0);
+        let newestIdSeen = lastFetchedBig;
 
         while (!allMessagesFetched) {
             const options = fetchBefore ? { limit: 100, before: fetchBefore } : { limit: 100 };
-            console.log('Fetching messages with options:', options);
-
             const messages = await channel.messages.fetch(options);
 
             if (messages.size === 0) {
@@ -164,128 +257,91 @@ const fetchMessage = async (client, channelId) => {
                 break;
             }
 
-            // Sort newest → oldest so we always process newest first and can exit cleanly
             const sorted = Array.from(messages.values()).sort((a, b) => {
                 const aId = BigInt(a.id);
                 const bId = BigInt(b.id);
-                if (aId > bId) return -1;
-                if (aId < bId) return 1;
-                return 0;
+                return aId > bId ? -1 : aId < bId ? 1 : 0;
             });
 
             for (const message of sorted) {
-                console.log(`Fetched message ID: ${message.id}`);
-                // Convert to BigInt once
                 const msgIdBig = BigInt(message.id);
 
-                // --- Stop early if we've reached or passed the last fetched ID ---
-                if (lastFetchedId && msgIdBig === BigInt(lastFetchedId)) {
-                    console.log(`Reached last fetched ID ${lastFetchedId}. Stopping.`);
+                // FIX: use <= so deleted-message edge case (stored id no longer
+                // exists in channel) still terminates the loop correctly.
+                if (lastFetchedId && msgIdBig <= lastFetchedBig) {
+                    console.log(`Reached last fetched threshold ${lastFetchedId}. Stopping.`);
                     allMessagesFetched = true;
                     reachedLastFetched = true;
                     break;
                 }
 
-                // Update newest ID seen
                 if (msgIdBig > newestIdSeen) {
                     newestIdSeen = msgIdBig;
-                    console.log(`Updated newestIdSeen to: ${newestIdSeen.toString()}`);
                 }
 
-                // --- Process and store message using the separate function ---
                 await processAndStoreMessage(message);
             }
 
-            // Stop if loop was broken by reaching lastFetchedId
             if (allMessagesFetched) break;
 
-            // Pagination: fetch older messages next (last element is now the oldest)
             fetchBefore = sorted[sorted.length - 1].id;
-            console.log(`Continuing fetch before message ID: ${fetchBefore}`);
 
-            // If we got fewer than 100, it’s the last batch
             if (messages.size < 100) {
                 console.log('Fetched final batch (less than 100).');
                 allMessagesFetched = true;
             }
         }
-        console.log(`Fetch loop ended. allMessagesFetched=${allMessagesFetched}, reachedLastFetched=${reachedLastFetched}`);
-        console.log(`Final newestIdSeen: ${newestIdSeen.toString()}`);
-        // --- Update last fetched ID after full run ---
-        console.log('Fetch loop completed. Attempting to update lastFetchedId...');
-        const upsertKey = 'lastfetchedidV3';
 
-        try {
-            // Only update the stored lastFetchedId if we've seen a newer message than what's stored.
-            const storedBig = lastFetchedId ? BigInt(lastFetchedId) : BigInt(0);
-            console.log(`newestIdSeen: ${newestIdSeen.toString()}, storedBig: ${storedBig.toString()}`);
-            if (newestIdSeen > storedBig) {
-                await LastFetchedId.updateOne(
-                    { key: upsertKey },
-                    { $set: { value: newestIdSeen.toString() } },
-                    { upsert: true }
-                );
-                console.log(`✅ Successfully updated ${upsertKey} to ${newestIdSeen.toString()}`);
-            } else {
-                console.log(
-                    `ℹ️ Not updating ${upsertKey}: stored lastFetchedId (${lastFetchedId}) is newer or equal.`
-                );
-            }
-        } catch (err) {
-            console.error('Error updating last fetched ID after fetch run:', err);
+        console.log(
+            `Fetch loop ended. allMessagesFetched=${allMessagesFetched}, reachedLastFetched=${reachedLastFetched}`
+        );
+
+        if (newestIdSeen > lastFetchedBig) {
+            await advanceLastFetchedId(newestIdSeen.toString());
+            console.log(`Advanced lastFetchedId to ${newestIdSeen.toString()}`);
+        } else {
+            console.log('No newer messages seen; lastFetchedId unchanged.');
         }
-        
         console.log('✅ fetchMessage function completed successfully');
-
     } catch (err) {
         console.error('❌ Error in fetchMessage:', err);
     }
 };
 
-// --- Function to listen for new messages and process them ---
+/**
+ * Realtime listener. Each incoming message is processed in its own task —
+ * concurrency safety is handled inside processAndStoreMessage.
+ */
 const listenForNewMessages = (client, channelId) => {
-    let lastMessageTime = null;
-    let updateTimeout = null;
-
     client.on('messageCreate', async (message) => {
-        // Only process messages from the specified channel
         if (message.channelId !== channelId) return;
 
-        console.log(`New message received in channel ${channelId}: ${message.id}`);
-
         try {
-            // Process the new message using the same function
-            const processed = await processAndStoreMessage(message);
-
-            // Clear any pending update timeout
-            if (updateTimeout) {
-                clearTimeout(updateTimeout);
-            }
-
-            // Set a new timeout to update lastFetchedId after 5 seconds of inactivity
-            const msgIdBig = BigInt(message.id);
-            updateTimeout = setTimeout(async () => {
-                try {
-                    await LastFetchedId.updateOne(
-                        { key: 'lastfetchedidV3' },
-                        { $set: { value: msgIdBig.toString() } },
-                        { upsert: true }
-                    );
-                    console.log(`Updated lastFetchedId to ${msgIdBig.toString()}`);
-                    updateTimeout = null;
-                } catch (err) {
-                    console.error('Error updating lastFetchedId:', err);
-                }
-            }, 5000); // 5 seconds
-
-            lastMessageTime = Date.now();
+            await processAndStoreMessage(message);
+            // Advance watermark per message; it's atomic-monotonic now, so safe
+            // even if multiple messages arrive out of order.
+            await advanceLastFetchedId(message.id);
         } catch (err) {
             console.error('Error processing new message:', err);
         }
     });
-    console.log(`Started listening for new messages in channel ${channelId}`);
+
+    // Also handle message edits — embeds often arrive as edits, not creates.
+    client.on('messageUpdate', async (_oldMsg, newMessage) => {
+        if (newMessage.channelId !== channelId) return;
+        try {
+            // Some edits arrive as partials; fetch full message before parsing.
+            const full = newMessage.partial ? await newMessage.fetch() : newMessage;
+            await processAndStoreMessage(full);
+        } catch (err) {
+            console.error('Error processing edited message:', err);
+        }
+    });
+
+    console.log(`Started listening for new messages and edits in channel ${channelId}`);
 };
 
 module.exports = fetchMessage;
 module.exports.listenForNewMessages = listenForNewMessages;
 module.exports.processAndStoreMessage = processAndStoreMessage;
+module.exports.advanceLastFetchedId = advanceLastFetchedId;

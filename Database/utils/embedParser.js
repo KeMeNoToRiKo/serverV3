@@ -1,14 +1,18 @@
+/**
+ * embedParser.js
+ * Parses a Discord message (with embeds) into structured Q&A data.
+ *
+ * Returns null when the message carries no recognisable question/answer content.
+ */
 async function parseMessageEmbed(message) {
     const content = message.content || '';
-    const contentMatch = content.toLowerCase();
+    const contentLower = content.toLowerCase();
 
-    let matchedInEmbed = false;
-    let embedContent = [];
     const embeds = message.embeds || [];
 
-    // If no embeds, return a simple object when content exists, otherwise null
-    if (!embeds || embeds.length === 0) {
-        if (!contentMatch) return null;
+    // No embeds — return minimal content object or null.
+    if (embeds.length === 0) {
+        if (!contentLower) return null;
         return {
             author: message.author?.username || 'Unknown',
             content: message.content,
@@ -19,58 +23,64 @@ async function parseMessageEmbed(message) {
         };
     }
 
-    // console.log("Embeds", embeds)
+    // Collect all text parts from every embed and check for a question marker.
+    let embedContent = [];
+    let matchedInEmbed = false;
 
     for (const embed of embeds) {
-        let partsToSearch = [];
+        const partsToSearch = [];
 
         if (embed.title) partsToSearch.push(embed.title);
         if (embed.description) partsToSearch.push(embed.description);
         if (embed.fields?.length) {
-            embed.fields.forEach(f => {
-                partsToSearch.push(f.name, f.value);
-            });
+            embed.fields.forEach((f) => partsToSearch.push(f.name, f.value));
         }
         if (embed.footer?.text) partsToSearch.push(embed.footer.text);
 
-        
-
         embedContent = embedContent.concat(partsToSearch);
-        if (partsToSearch.some(text => typeof text === 'string' && text.toLowerCase().includes('question')) ) {
+
+        if (partsToSearch.some((text) => typeof text === 'string' && text.toLowerCase().includes('question'))) {
             matchedInEmbed = true;
         }
+    }
 
-        }
-    
-    if (!matchedInEmbed && !contentMatch) return null;
+    if (!matchedInEmbed && !contentLower) return null;
 
-        // FORMATTING
+    // ── Formatting ──────────────────────────────────────────────────────────
 
-        //TITLE
-        const title = embedContent[0] || '';
-        //QUESTIONS
-         const question = embedContent.find(e => typeof e === 'string' && e.includes('**Question:**'))?.replace('**Question:**', '').trim() || '';
-        
-         //ANSWER LINES
-         const answerLines = embedContent
-        .flatMap(e => e.split('\n'))
-        .filter(line => line.includes('✅') || line.includes('❌') || line.includes('⚠️'));
+    // Title: first element of the collected embed parts.
+    const title = embedContent[0] || '';
 
-        //FOOTER
-        const footerText = embeds[0]?.footer?.text || '';
-    const [, questionId = '', questionType = ''] = footerText.split('•').map(x => x.trim());
+    // Question: the line tagged with **Question:**.
+    const question =
+        embedContent
+            .find((e) => typeof e === 'string' && e.includes('**Question:**'))
+            ?.replace('**Question:**', '')
+            .trim() || '';
 
-        const answers = answerLines.map(answer => {
+    // Answer lines: lines containing a result emoji.
+    const answerLines = embedContent
+        .flatMap((e) => e.split('\n'))
+        .filter((line) => line.includes('✅') || line.includes('❌') || line.includes('⚠️'));
+
+    // Footer: "• <Question_ID> • <Question_Type>"
+    const footerText = embeds[0]?.footer?.text || '';
+    const [, questionId = '', questionType = ''] = footerText.split('•').map((x) => x.trim());
+
+    // Parse each answer line into a structured object.
+    const answers = answerLines
+        .map((answer) => {
             const emojiMatch = answer.match(/(✅|❌|⚠️)/);
             if (!emojiMatch) return null;
 
-            const parts = answer.trim().split(' ');
+            const parts = answer.trim().split(' ').filter(Boolean);
+            if (parts.length < 2) return null; // guard: need at least emoji + answer ID
+
             const answerId = parts[parts.length - 1].replace(/`/g, '');
             const answerText = parts.slice(1, parts.length - 1).join(' ').replace(/`/g, '').trim();
 
             const emoji = emojiMatch[0];
-            // For warning emoji, mark Correct as null (unknown)
-            const correct = emoji === '✅' ? true : (emoji === '❌' ? false : null);
+            const correct = emoji === '✅' ? true : emoji === '❌' ? false : null;
 
             return {
                 Answer_Text: answerText,
@@ -80,21 +90,19 @@ async function parseMessageEmbed(message) {
                 Correct: correct,
                 _rawEmoji: emoji,
             };
-        }).filter(Boolean);
+        })
+        .filter(Boolean);
 
-        const hasWarning = answers.some(a => a._rawEmoji === '⚠️');
+    const hasWarning = answers.some((a) => a._rawEmoji === '⚠️');
 
-        return {
-            Title: title,
-            Question: question,
-            Answer: answers,
-            Question_ID: questionId || null,
-            Question_Type: questionType || null,
-            partial: hasWarning || null,
-        };
-
-    }
-  
-
+    return {
+        Title: title,
+        Question: question,
+        Answer: answers,
+        Question_ID: questionId || null,
+        Question_Type: questionType || null,
+        partial: hasWarning || null,
+    };
+}
 
 module.exports = parseMessageEmbed;

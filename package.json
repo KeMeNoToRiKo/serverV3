@@ -19,12 +19,10 @@
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
     "express-rate-limit": "^8.2.1",
-    "fs": "^0.0.1-security",
     "ini": "^5.0.0",
     "mongodb": "^6.21.0",
     "mongoose": "^8.20.1",
-    "openai": "^6.9.1",
-    "path": "^0.12.7"
+    "openai": "^6.9.1"
   },
   "repository": {
     "type": "git",
